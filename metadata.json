@@ -1,0 +1,5 @@
+{
+  "name": "Instant OSS",
+  "description": "A sophisticated local-first gallery viewer that respects folder structures, featuring Gemini-powered image analysis.",
+  "requestFramePermissions": []
+}
