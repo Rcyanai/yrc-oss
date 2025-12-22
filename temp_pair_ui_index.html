@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Instant OSS - Local Asset Gallery</title>
+    
+    <!-- Dependencies -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Config -->
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: { sans: ['Inter', 'sans-serif'] },
+            colors: { gray: { 750: '#2d3748', 850: '#1a202c', 950: '#0d1117' } },
+            animation: {
+              'float': 'float 6s ease-in-out infinite',
+              'float-delayed': 'float 6s ease-in-out 3s infinite',
+              'fade-in-up': 'fadeInUp 1s ease-out forwards',
+              'pulse-slow': 'pulse 8s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+            },
+            keyframes: {
+              float: { '0%, 100%': { transform: 'translateY(0)' }, '50%': { transform: 'translateY(-20px)' } },
+              fadeInUp: { '0%': { opacity: '0', transform: 'translateY(40px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } }
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+      body { background-color: #050505; perspective: 1000px; overflow: hidden; }
+      .glass-panel { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.05); }
+    </style>
+</head>
+<body class="text-white antialiased h-screen overflow-hidden selection:bg-indigo-500 selection:text-white">
+    <div id="root" class="h-full w-full"></div>
+
+    <script type="text/babel" data-presets="typescript,react">
+        const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+        // --- TYPES & UTILS ---
+        
+        const ViewMode = {
+            HIERARCHY: 'HIERARCHY',
+            ALL_PHOTOS: 'ALL_PHOTOS',
+        };
+
+        const parseFilesToTree = (files) => {
+            const root = { id: 'root', name: 'Root', path: '', type: 'folder', children: [] };
+            const allImages = [];
+            
+            const textFilesMap = new Map();
+            const imageFiles = [];
+
+            Array.from(files).forEach((file) => {
+                if (file.name.startsWith('.')) return;
+                const path = file.webkitRelativePath || file.name;
+                const lastSlash = path.lastIndexOf('/');
+                const dir = lastSlash === -1 ? '' : path.substring(0, lastSlash);
+                const name = path.substring(lastSlash + 1);
+                
+                if (file.type.startsWith('image/')) {
+                     imageFiles.push({ file, path, dir, name });
+                } else if (file.type === 'text/plain' || name.toLowerCase().endsWith('.txt')) {
+                    const dotIndex = name.lastIndexOf('.');
+                    const basename = dotIndex === -1 ? name : name.substring(0, dotIndex);
+                    const key = dir ? `${dir}/${basename}` : basename;
+                    textFilesMap.set(key, file);
+                }
+            });
+
+            imageFiles.forEach(({ file, path, dir, name }) => {
+                const dotIndex = name.lastIndexOf('.');
+                const basename = dotIndex === -1 ? name : name.substring(0, dotIndex);
+                const key = dir ? `${dir}/${basename}` : basename;
+                const textFile = textFilesMap.get(key);
+                const pathParts = path.split('/');
+                
+                let currentNode = root;
+                pathParts.forEach((part, index) => {
+                    const isFile = index === pathParts.length - 1;
+                    if (isFile) {
+                        const fileNode = {
+                            id: `${currentNode.path}/${part}`,
+                            name: part,
+                            path: path,
+                            type: 'file',
+                            children: [],
+                            file: file,
+                            textFile: textFile,
+                            url: URL.createObjectURL(file),
+                            parent: currentNode,
+                            isDeleted: false
+                        };
+                        currentNode.children.push(fileNode);
+                        allImages.push(fileNode);
+                    } else {
+                        let folderNode = currentNode.children.find(child => child.name === part && child.type === 'folder');
+                        if (!folderNode) {
+                            folderNode = {
+                                id: `${currentNode.path}/${part}`,
+                                name: part,
+                                path: currentNode.path ? `${currentNode.path}/${part}` : part,
+                                type: 'folder',
+                                children: [],
+                                parent: currentNode
+                            };
+                            currentNode.children.push(folderNode);
+                        }
+                        currentNode = folderNode;
+                    }
+                });
+            });
+            return { root, allImages };
+        };
+
+        const processImageForExport = (file) => {
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        const SHORT_EDGE_TARGET = 1024;
+                        let width = img.width;
+                        let height = img.height;
+                        const shortEdge = Math.min(width, height);
+                        if (shortEdge <= SHORT_EDGE_TARGET) {
+                            resolve({ blob: file, isOriginal: true });
+                            return;
+                        }
+                        const scale = SHORT_EDGE_TARGET / shortEdge;
+                        width = Math.round(width * scale);
+                        height = Math.round(height * scale);
+                        const canvas = document.createElement('canvas');
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        if (ctx) {
+                            ctx.imageSmoothingEnabled = true;
+                            ctx.imageSmoothingQuality = 'high';
+                            ctx.drawImage(img, 0, 0, width, height);
+                            canvas.toBlob((blob) => {
+                                resolve({ blob, isOriginal: false });
+                            }, 'image/jpeg', 0.80);
+                        } else {
+                            resolve({ blob: file, isOriginal: true });
+                        }
+                    };
+                    img.onerror = () => resolve({ blob: file, isOriginal: true });
+                    img.src = e.target.result;
+                };
+                reader.onerror = () => resolve({ blob: file, isOriginal: true });
+                reader.readAsDataURL(file);
+            });
+        };
+
+        // --- COMPONENTS ---
+
+        const FolderTree = ({ node, onSelect, selectedId, level = 0 }) => {
+            const [isOpen, setIsOpen] = useState(true);
+            if (node.type === 'file') return null;
+            const folderChildren = node.children.filter(c => c.type === 'folder');
+            const hasSubFolders = folderChildren.length > 0;
+            const isSelected = node.id === selectedId;
+
+            return (
+                <div className="select-none text-sm font-medium">
+                    <div
+                        className={`flex items-center gap-2 px-3 py-2 cursor-pointer transition-all duration-200 rounded-lg mx-3 mb-1 group ${isSelected ? 'bg-indigo-600/10 text-indigo-300' : 'text-gray-400 hover:bg-white/5 hover:text-gray-200'}`}
+                        style={{ paddingLeft: `${level * 12 + 12}px` }}
+                        onClick={(e) => { e.stopPropagation(); onSelect(node); }}
+                    >
+                        <button onClick={(e) => { e.stopPropagation(); setIsOpen(!isOpen); }} className={`p-0.5 hover:bg-white/10 rounded transition-colors text-gray-500 ${!hasSubFolders ? 'invisible' : ''}`}>
+                            <svg className={`w-3 h-3 transition-transform duration-200 ${isOpen ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                        </button>
+                        <svg className={`w-4 h-4 shrink-0 transition-colors ${isSelected ? 'text-indigo-400' : 'text-gray-500 group-hover:text-gray-400'}`} fill="currentColor" viewBox="0 0 20 20"><path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" /></svg>
+                        <span className="truncate">{node.name === 'Root' ? 'My Library' : node.name}</span>
+                    </div>
+                    {isOpen && hasSubFolders && (
+                        <div className="mt-1 border-l border-white/5 ml-6">
+                            {folderChildren.map((child) => <FolderTree key={child.id} node={child} onSelect={onSelect} selectedId={selectedId} level={level} />)}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const Sidebar = ({ root, selectedNode, onSelect }) => {
+            return (
+                <div className="w-80 flex-shrink-0 h-full flex flex-col bg-transparent">
+                    <div className="p-8 pb-4">
+                        <h2 className="text-xl font-bold text-white tracking-tight flex items-center gap-3">
+                            <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-900/50"><span className="text-lg font-black">I</span></div>
+                            Instant OSS
+                        </h2>
+                        <p className="text-xs text-gray-500 mt-2 ml-1">Local Asset Gallery</p>
+                    </div>
+                    <div className="px-4 py-2"><div className="h-[1px] w-full bg-gradient-to-r from-transparent via-white/10 to-transparent"></div></div>
+                    <div className="flex-1 overflow-y-auto py-4 custom-scrollbar">
+                        <FolderTree node={root} onSelect={onSelect} selectedId={selectedNode?.id || null} />
+                    </div>
+                    <div className="p-6">
+                        <div className="bg-gradient-to-br from-white/5 to-transparent rounded-2xl p-4 border border-white/5 shadow-xl backdrop-blur-md">
+                            <div className="flex items-center gap-3 mb-2">
+                                <div className="w-8 h-8 rounded-full bg-black/40 flex items-center justify-center border border-white/5"><svg className="w-4 h-4 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg></div>
+                                <span className="text-xs font-bold text-white">Status: Secure</span>
+                            </div>
+                            <p className="text-[10px] text-gray-400 leading-relaxed">Your files are processing locally in browser memory. No external uploads.</p>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const GalleryItem = ({ node, onClick, onContextMenu }) => {
+            const [isHovered, setIsHovered] = useState(false);
+            const [textPreview, setTextPreview] = useState(null);
+            const [copyStatus, setCopyStatus] = useState('Copy');
+
+            useEffect(() => {
+                if (isHovered && node.textFile && !textPreview) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => setTextPreview(e.target.result);
+                    reader.readAsText(node.textFile);
+                }
+            }, [isHovered, node, textPreview]);
+
+            const handleCopy = (e) => {
+                e.stopPropagation();
+                if (textPreview) {
+                    navigator.clipboard.writeText(textPreview);
+                    setCopyStatus('Copied!');
+                    setTimeout(() => setCopyStatus('Copy'), 2000);
+                }
+            };
+
+            return (
+                <div 
+                    className={`group relative aspect-[3/4] rounded-2xl overflow-hidden cursor-pointer border transition-all duration-500 hover:-translate-y-1 ${node.isDeleted ? 'bg-red-900/10 border-red-500/20' : 'bg-black/40 border-white/5 hover:border-indigo-500/50 hover:shadow-[0_15px_40px_-10px_rgba(99,102,241,0.2)]'}`}
+                    onClick={() => !node.isDeleted && onClick(node)}
+                    onContextMenu={(e) => onContextMenu(e, node)}
+                    onMouseEnter={() => setIsHovered(true)}
+                    onMouseLeave={() => setIsHovered(false)}
+                >
+                    {/* Image */}
+                    {node.url && (
+                        <img 
+                            src={node.url} 
+                            alt={node.name} 
+                            loading="lazy" 
+                            className={`w-full h-full object-cover transition-all duration-700 ${node.isDeleted ? 'blur-sm grayscale brightness-[0.25]' : 'group-hover:scale-105 opacity-80 group-hover:opacity-100'}`} 
+                        />
+                    )}
+
+                    {/* Text Hover Overlay */}
+                    {!node.isDeleted && node.textFile && isHovered && textPreview && (
+                        <div className="absolute inset-0 bg-black/85 backdrop-blur-md p-5 flex flex-col animate-in fade-in duration-200 z-20">
+                            <div className="flex-1 overflow-hidden relative">
+                                <p className="text-gray-300 text-xs font-mono whitespace-pre-wrap leading-relaxed opacity-90 line-clamp-[12]">
+                                    {textPreview}
+                                </p>
+                                <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-black to-transparent pointer-events-none"></div>
+                            </div>
+                            <button 
+                                onClick={handleCopy}
+                                className="mt-3 w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-bold text-white transition-all shadow-lg shadow-indigo-900/20 flex items-center justify-center gap-2 transform active:scale-95"
+                            >
+                                {copyStatus === 'Copied!' ? (
+                                    <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                ) : (
+                                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
+                                )}
+                                {copyStatus}
+                            </button>
+                        </div>
+                    )}
+
+                    {/* Deleted Overlay */}
+                    {node.isDeleted && (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center z-20 animate-in fade-in duration-300">
+                            <div className="w-14 h-14 rounded-full bg-red-500/10 backdrop-blur-md border border-red-500/20 flex items-center justify-center mb-3 shadow-lg">
+                                <svg className="w-6 h-6 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                            </div>
+                            <span className="text-[10px] text-red-500 uppercase tracking-[0.2em] font-bold">Deleted</span>
+                            <span className="text-[9px] text-gray-400 mt-2 font-mono bg-black/50 px-2 py-1 rounded border border-white/5">Right-click to Restore</span>
+                        </div>
+                    )}
+
+                    {/* Normal Info Overlay (Hide when hovering text) */}
+                    {!node.isDeleted && (!node.textFile || !isHovered) && (
+                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black via-black/80 to-transparent p-4 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out pointer-events-none">
+                            <p className="text-white text-sm truncate font-medium">{node.name}</p>
+                            <div className="flex items-center justify-between mt-1">
+                                <div className="flex items-center gap-2">
+                                    <p className="text-indigo-300 text-[9px] uppercase tracking-wider">{node.type}</p>
+                                    {node.textFile && (
+                                        <div className="flex items-center gap-1 bg-white/10 px-1.5 py-0.5 rounded-full border border-white/5 backdrop-blur-md">
+                                            <svg className="w-3 h-3 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                            <span className="text-[8px] text-gray-300 font-bold">TXT</span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const Gallery = ({ nodes, onImageClick, onFolderClick, onToggleDelete, title }) => {
+            const [visibleCount, setVisibleCount] = useState(60);
+            const loaderRef = useRef(null);
+
+            useEffect(() => { setVisibleCount(60); }, [nodes, title]);
+
+            useEffect(() => {
+                const observer = new IntersectionObserver((entries) => {
+                    if (entries[0].isIntersecting) setVisibleCount((prev) => Math.min(prev + 60, nodes.length));
+                }, { threshold: 0.1, rootMargin: '200px' });
+                if (loaderRef.current) observer.observe(loaderRef.current);
+                return () => { if (loaderRef.current) observer.unobserve(loaderRef.current); };
+            }, [nodes.length]);
+
+            const folders = useMemo(() => nodes.filter(n => n.type === 'folder'), [nodes]);
+            const allFiles = useMemo(() => nodes.filter(n => n.type === 'file'), [nodes]);
+            const visibleFiles = allFiles.slice(0, visibleCount);
+
+            const handleRightClick = (e, node) => { e.preventDefault(); if (onToggleDelete) onToggleDelete(node); };
+
+            if (nodes.length === 0) {
+                return (
+                    <div className="h-full flex flex-col items-center justify-center text-gray-500">
+                        <div className="w-24 h-24 bg-white/[0.02] rounded-full flex items-center justify-center mb-6 border border-white/5 shadow-inner"><svg className="w-10 h-10 opacity-30" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg></div>
+                        <h3 className="text-lg font-medium text-gray-300 mb-1">Empty Directory</h3>
+                        <p className="text-sm font-light tracking-wide text-gray-500">There are no files to display here.</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="p-8 md:p-12 h-full overflow-y-auto custom-scrollbar">
+                    <div className="flex items-end justify-between mb-10 border-b border-white/5 pb-6">
+                        <div>
+                            <h1 className="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-white to-gray-400 mb-2">{title}</h1>
+                            <p className="text-sm text-gray-500 font-mono flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-indigo-500"></span>Active Viewer</p>
+                        </div>
+                        <div className="text-right hidden sm:block">
+                            <span className="text-3xl font-light text-white block">{nodes.length}</span>
+                            <span className="text-xs text-gray-500 uppercase tracking-widest">Items</span>
+                        </div>
+                    </div>
+                    {folders.length > 0 && (
+                        <div className="mb-12">
+                            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-[0.2em] mb-6 pl-1">Directories</h3>
+                            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-6">
+                                {folders.map((folder) => (
+                                    <div key={folder.id} onClick={() => onFolderClick && onFolderClick(folder)} className="group cursor-pointer bg-white/[0.02] border border-white/5 hover:border-indigo-500/40 hover:bg-white/[0.05] rounded-2xl p-6 transition-all duration-300 backdrop-blur-sm hover:shadow-[0_8px_25px_rgba(0,0,0,0.3)] hover:-translate-y-1 flex flex-col items-center justify-center aspect-[4/3]">
+                                        <div className="mb-4 text-gray-600 group-hover:text-indigo-400 transition-colors duration-300 transform group-hover:scale-110"><svg className="w-14 h-14" fill="currentColor" viewBox="0 0 20 20"><path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" /></svg></div>
+                                        <div className="text-center w-full"><p className="text-sm font-medium text-gray-300 truncate group-hover:text-white transition-colors">{folder.name}</p><p className="text-[10px] text-gray-500 mt-1 uppercase tracking-wide">{folder.children.length} items</p></div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                    {allFiles.length > 0 && (
+                        <div>
+                            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-[0.2em] mb-6 pl-1">Media Assets</h3>
+                            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-6">
+                                {visibleFiles.map((fileNode) => <GalleryItem key={fileNode.id} node={fileNode} onClick={onImageClick} onContextMenu={handleRightClick} />)}
+                            </div>
+                            {visibleCount < allFiles.length && <div ref={loaderRef} className="h-20 flex items-center justify-center mt-8"><div className="w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div></div>}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const Lightbox = ({ node, onClose, onNext, onPrev }) => {
+            const [textContent, setTextContent] = useState('');
+            const [copyStatus, setCopyStatus] = useState('Copy Text');
+
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (e.key === 'Escape') onClose();
+                    if (e.key === 'ArrowRight') onNext();
+                    if (e.key === 'ArrowLeft') onPrev();
+                };
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, [onClose, onNext, onPrev]);
+
+            useEffect(() => {
+                if (node && node.textFile) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => setTextContent(e.target.result);
+                    reader.readAsText(node.textFile);
+                } else {
+                    setTextContent('');
+                }
+                setCopyStatus('Copy Text');
+            }, [node]);
+
+            const handleCopy = () => {
+                if (textContent) {
+                    navigator.clipboard.writeText(textContent);
+                    setCopyStatus('Copied!');
+                    setTimeout(() => setCopyStatus('Copy Text'), 2000);
+                }
+            };
+
+            if (!node.url) return null;
+
+            return (
+                <div className="fixed inset-0 z-50 bg-black/95 flex flex-col animate-in fade-in duration-200">
+                    <div className="absolute top-0 left-0 right-0 p-4 flex justify-between items-center z-20 bg-gradient-to-b from-black/80 to-transparent pointer-events-none">
+                        <div className="text-white pointer-events-auto"><h2 className="font-medium text-lg">{node.name}</h2><p className="text-xs text-gray-400 font-mono">{node.path}</p></div>
+                        <div className="flex items-center gap-4 pointer-events-auto">
+                            <button onClick={onClose} className="p-2 text-white hover:bg-white/10 rounded-full transition-colors"><svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
+                        </div>
+                    </div>
+                    
+                    <div className="flex-1 flex overflow-hidden">
+                        {/* Main Image Area */}
+                        <div className="flex-1 relative flex items-center justify-center h-full group">
+                            <button onClick={onPrev} className="absolute left-4 p-4 text-white/50 hover:text-white hover:bg-white/10 rounded-full z-10 transition-all opacity-0 group-hover:opacity-100 -translate-x-4 group-hover:translate-x-0"><svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 19l-7-7 7-7" /></svg></button>
+                            <img src={node.url} alt={node.name} className="max-h-full max-w-full object-contain shadow-2xl transition-transform duration-300" />
+                            <button onClick={onNext} className="absolute right-4 p-4 text-white/50 hover:text-white hover:bg-white/10 rounded-full z-10 transition-all opacity-0 group-hover:opacity-100 translate-x-4 group-hover:translate-x-0"><svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5l7 7-7 7" /></svg></button>
+                        </div>
+
+                        {/* Right Text Panel - Only if textFile exists */}
+                        {node.textFile && (
+                            <div className="w-[400px] flex-shrink-0 bg-gray-900 border-l border-white/10 flex flex-col h-full animate-in slide-in-from-right duration-300 shadow-2xl z-30">
+                                <div className="p-6 border-b border-white/5 flex justify-between items-center">
+                                    <h3 className="text-white font-bold flex items-center gap-2">
+                                        <svg className="w-5 h-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                        Text Info
+                                    </h3>
+                                    <button onClick={handleCopy} className="text-xs bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-md text-white transition-colors border border-white/5">{copyStatus}</button>
+                                </div>
+                                <div className="flex-1 overflow-y-auto p-6 custom-scrollbar">
+                                    <pre className="text-gray-300 text-sm font-mono whitespace-pre-wrap leading-relaxed">{textContent}</pre>
+                                </div>
+                                <div className="p-4 border-t border-white/5 bg-black/20 text-xs text-gray-500 text-center">
+                                    Linked: {node.name.replace(/\.[^/.]+$/, "")}.txt
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const ShareModal = ({ isOpen, onClose, rootNode, stats }) => {
+            const [step, setStep] = useState('idle');
+            const [progress, setProgress] = useState(0);
+            const [downloadUrl, setDownloadUrl] = useState(null);
+
+            useEffect(() => {
+                if (isOpen) { setStep('idle'); setProgress(0); setDownloadUrl(null); }
+            }, [isOpen]);
+
+            const handleGenerateSnapshot = async () => {
+                if (!rootNode) return;
+                setStep('processing');
+                let processedCount = 0;
+                const totalFiles = stats.files;
+                const zip = new JSZip();
+                const imagesFolder = zip.folder("images");
+                
+                const serializeNodeStructure = (node) => {
+                     const sNode = {
+                        id: node.id,
+                        name: node.name,
+                        path: node.path,
+                        type: node.type,
+                        isDeleted: node.isDeleted,
+                        children: [],
+                        imageRef: null,
+                        textRef: null
+                     };
+                     if (node.type === 'file') {
+                         sNode.imageRef = node.id.replace(/\//g, '_');
+                         if (node.textFile) {
+                             sNode.textRef = sNode.imageRef + '.txt';
+                         }
+                     }
+                     if (node.children) {
+                         sNode.children = node.children.map(serializeNodeStructure);
+                     }
+                     return sNode;
+                };
+
+                const processNodes = async (node) => {
+                    if (node.type === 'file' && node.file) {
+                        try {
+                            const { blob } = await processImageForExport(node.file);
+                            const safeName = node.id.replace(/\//g, '_');
+                            imagesFolder.file(safeName, blob);
+                            if (node.textFile) {
+                                imagesFolder.file(safeName + '.txt', node.textFile);
+                            }
+                        } catch (e) { console.error(e); }
+                        processedCount++;
+                        setProgress(Math.round((processedCount / totalFiles) * 100));
+                    }
+                    if (node.children) {
+                        for (const child of node.children) {
+                            await processNodes(child);
+                        }
+                    }
+                };
+
+                setTimeout(async () => {
+                    try {
+                        await processNodes(rootNode);
+                        const structure = serializeNodeStructure(rootNode);
+                        zip.file("data.json", JSON.stringify(structure));
+                        const content = await zip.generateAsync({ type: "blob" });
+                        const url = URL.createObjectURL(content);
+                        setDownloadUrl(url);
+                        setStep('ready');
+                    } catch (error) {
+                        console.error("Export failed", error);
+                        alert("Export failed.");
+                        setStep('idle');
+                    }
+                }, 100);
+            };
+
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+                    <div className="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-md p-6 shadow-2xl relative">
+                        <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-white transition-colors"><svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
+                        <h2 className="text-xl font-bold text-white mb-2">Share Gallery Snapshot</h2>
+                        <p className="text-gray-400 text-sm mb-6">Since this app runs locally without a cloud server, you can share a "Snapshot File" containing your folder structure and high-quality images.</p>
+                        {step === 'idle' && (
+                            <div className="text-center py-4">
+                                <div className="bg-indigo-900/30 border border-indigo-500/30 p-4 rounded-xl mb-6"><p className="text-indigo-200 text-sm font-medium">Ready to bundle {stats.files} items</p><p className="text-indigo-400/60 text-xs mt-1">Exporting optimized Zip archive (HD Images + Text Pairs). Hidden files are included.</p></div>
+                                <button onClick={handleGenerateSnapshot} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 px-4 rounded-xl transition-colors shadow-lg shadow-indigo-900/20 flex items-center justify-center gap-2"><svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>Generate HD Snapshot</button>
+                            </div>
+                        )}
+                        {step === 'processing' && (
+                            <div className="py-8">
+                                <div className="flex justify-between text-xs font-mono text-gray-400 mb-2"><span>COMPRESSING ASSETS...</span><span>{progress}%</span></div>
+                                <div className="h-2 bg-gray-800 rounded-full overflow-hidden"><div className="h-full bg-indigo-500 transition-all duration-300" style={{ width: `${progress}%` }} /></div>
+                                <p className="text-center text-xs text-gray-500 mt-4 animate-pulse">Encoding high-definition assets...</p>
+                            </div>
+                        )}
+                        {step === 'ready' && downloadUrl && (
+                            <div className="py-2 animate-in slide-in-from-bottom-2">
+                                <div className="flex justify-center mb-6"><div className="w-16 h-16 bg-green-500/20 rounded-full flex items-center justify-center"><svg className="w-8 h-8 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg></div></div>
+                                <h3 className="text-center text-white font-medium mb-1">Snapshot Ready!</h3>
+                                <p className="text-center text-gray-500 text-xs mb-6">Send this archive to your friends. They can open it using the "Import Snapshot" button.</p>
+                                <a href={downloadUrl} download={`instant_oss_snapshot_${new Date().toISOString().slice(0,10)}.zip`} className="block w-full bg-green-600 hover:bg-green-500 text-white font-bold py-3 px-4 rounded-xl text-center transition-colors shadow-lg shadow-green-900/20">Download Archive (.zip)</a>
+                                <button onClick={onClose} className="block w-full mt-3 text-gray-500 hover:text-gray-300 text-sm py-2">Close</button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [rootNode, setRootNode] = useState(null);
+            const [currentNode, setCurrentNode] = useState(null);
+            const [allImages, setAllImages] = useState([]);
+            const [viewMode, setViewMode] = useState(ViewMode.HIERARCHY);
+            const [lightboxNode, setLightboxNode] = useState(null);
+            const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+            const [isImporting, setIsImporting] = useState(false);
+            const [stats, setStats] = useState({ totalFiles: 0, totalFolders: 0, totalSize: 0 });
+            const [updateTick, setUpdateTick] = useState(0);
+            const fileInputRef = useRef(null);
+            const importInputRef = useRef(null);
+
+            useEffect(() => {
+                return () => {
+                    allImages.forEach(node => {
+                        if (node.url && node.url.startsWith('blob:')) {
+                            URL.revokeObjectURL(node.url);
+                        }
+                    });
+                };
+            }, [allImages]);
+
+            const handleReset = () => {
+                if (window.confirm("Are you sure you want to clear the workspace? This will remove all loaded images from memory.")) {
+                    setRootNode(null); setCurrentNode(null); setAllImages([]); setStats({ totalFiles: 0, totalFolders: 0, totalSize: 0 }); setViewMode(ViewMode.HIERARCHY);
+                }
+            };
+
+            const handleUpload = (event) => {
+                const files = event.target.files;
+                if (!files || files.length === 0) return;
+                const { root, allImages: images } = parseFilesToTree(files);
+                let folders = 0;
+                let size = 0;
+                const countFolders = (node) => {
+                    if (node.type === 'folder') { folders++; node.children.forEach(countFolders); }
+                };
+                countFolders(root);
+                Array.from(files).forEach((f) => size += f.size);
+                setRootNode(root); setCurrentNode(root); setAllImages(images);
+                setStats({ totalFiles: images.length, totalFolders: folders - 1, totalSize: size });
+                event.target.value = '';
+            };
+
+            const handleImport = (event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+                setIsImporting(true);
+                
+                const deserializeNode = async (sNode, zip, allImagesAccumulator, parent) => {
+                    const node = {
+                        id: sNode.id,
+                        name: sNode.name,
+                        path: sNode.path,
+                        type: sNode.type,
+                        isDeleted: sNode.isDeleted,
+                        children: [],
+                        parent: parent
+                    };
+                    
+                    if (sNode.type === 'file' && sNode.imageRef) {
+                        try {
+                            const imgFile = zip.file("images/" + sNode.imageRef);
+                            if (imgFile) {
+                                const blob = await imgFile.async("blob");
+                                node.url = URL.createObjectURL(blob);
+                                node.file = new File([blob], node.name, { type: blob.type });
+                                if (sNode.textRef) {
+                                    const txtFile = zip.file("images/" + sNode.textRef);
+                                    if (txtFile) {
+                                        const txtBlob = await txtFile.async("blob");
+                                        node.textFile = new File([txtBlob], sNode.name.replace(/\.[^/.]+$/, ".txt"), { type: 'text/plain' });
+                                    }
+                                }
+                                allImagesAccumulator.push(node);
+                            }
+                        } catch (e) { console.error("Failed to load image from zip", sNode.name); }
+                    }
+
+                    if (sNode.children) {
+                        for (const childSNode of sNode.children) {
+                            const childNode = await deserializeNode(childSNode, zip, allImagesAccumulator, node);
+                            node.children.push(childNode);
+                        }
+                    }
+                    return node;
+                };
+
+                const processImport = async () => {
+                    try {
+                        const zip = await JSZip.loadAsync(file);
+                        const dataFile = zip.file("data.json");
+                        if (!dataFile) throw new Error("Invalid snapshot: missing data.json");
+                        
+                        const jsonStr = await dataFile.async("string");
+                        const structure = JSON.parse(jsonStr);
+                        
+                        const allImagesList = [];
+                        const restoredRoot = await deserializeNode(structure, zip, allImagesList, null);
+
+                        let folders = 0;
+                        const countFolders = (node) => {
+                            if (node.type === 'folder') { folders++; node.children.forEach(countFolders); }
+                        };
+                        countFolders(restoredRoot);
+
+                        setRootNode(restoredRoot); setCurrentNode(restoredRoot); setAllImages(allImagesList);
+                        setStats({ totalFiles: allImagesList.length, totalFolders: folders - 1, totalSize: 0 });
+                    } catch (err) {
+                        alert("Invalid snapshot file or corrupted archive.");
+                        console.error(err);
+                    } finally {
+                        setIsImporting(false);
+                        event.target.value = '';
+                    }
+                };
+                processImport();
+            };
+
+            const handleSelectNode = (node) => { setCurrentNode(node); setViewMode(ViewMode.HIERARCHY); };
+            const handlePublish = () => { setIsShareModalOpen(true); };
+            const handleToggleDelete = (node) => { node.isDeleted = !node.isDeleted; setUpdateTick(prev => prev + 1); };
+
+            const galleryNodes = useMemo(() => {
+                if (viewMode === ViewMode.ALL_PHOTOS) return allImages;
+                return currentNode ? currentNode.children : [];
+            }, [viewMode, currentNode, allImages, updateTick]);
+
+            const handleNextImage = () => {
+                if (!lightboxNode) return;
+                const currentList = galleryNodes.filter(n => n.type === 'file' && !n.isDeleted);
+                const idx = currentList.findIndex(n => n.id === lightboxNode.id);
+                if (idx !== -1 && idx < currentList.length - 1) setLightboxNode(currentList[idx + 1]);
+            };
+
+            const handlePrevImage = () => {
+                if (!lightboxNode) return;
+                const currentList = galleryNodes.filter(n => n.type === 'file' && !n.isDeleted);
+                const idx = currentList.findIndex(n => n.id === lightboxNode.id);
+                if (idx !== -1 && idx > 0) setLightboxNode(currentList[idx - 1]);
+            };
+
+            return (
+                <div className="h-screen w-full bg-[#050505] relative overflow-hidden flex font-sans selection:bg-indigo-500/30 selection:text-indigo-200">
+                    <div className="absolute top-[-20%] left-[-10%] w-[50vw] h-[50vh] bg-blue-900/10 rounded-full blur-[120px] animate-pulse-slow pointer-events-none"></div>
+                    <div className="absolute bottom-[-10%] right-[-5%] w-[40vw] h-[60vh] bg-indigo-900/10 rounded-full blur-[100px] animate-pulse-slow delay-1000 pointer-events-none"></div>
+                    <div className="absolute top-[30%] left-[40%] w-[30vw] h-[30vh] bg-purple-900/5 rounded-full blur-[80px] pointer-events-none"></div>
+                    
+                    <div className="absolute top-[10%] left-[5%] animate-float pointer-events-none opacity-40"><div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-white/10 to-transparent border border-white/5 backdrop-blur-md flex items-center justify-center shadow-lg transform -rotate-12"><svg className="w-8 h-8 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" /></svg></div></div>
+                    <div className="absolute bottom-[15%] right-[8%] animate-float-delayed pointer-events-none opacity-30"><div className="w-20 h-20 rounded-full bg-gradient-to-tl from-purple-500/10 to-transparent border border-white/5 backdrop-blur-md flex items-center justify-center shadow-2xl"><svg className="w-10 h-10 text-purple-300" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg></div></div>
+                    <div className="absolute top-[15%] right-[25%] animate-float pointer-events-none opacity-20" style={{ animationDelay: '2s' }}><div className="w-12 h-12 rounded-xl bg-white/5 border border-white/5 backdrop-blur-sm flex items-center justify-center transform rotate-6"><svg className="w-6 h-6 text-emerald-300" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg></div></div>
+
+                    <div className="relative z-10 w-full h-full flex flex-col md:flex-row max-w-[1920px] mx-auto animate-fade-in-up">
+                        {!rootNode ? (
+                            <div className="w-full h-full flex flex-col items-center justify-center text-center p-8 relative">
+                                <div className="max-w-xl w-full">
+                                    <div className="w-24 h-24 mx-auto mb-8 relative group"><div className="absolute inset-0 bg-indigo-500/20 blur-2xl rounded-full group-hover:bg-indigo-500/30 transition-all duration-500"></div><div className="relative w-full h-full bg-gradient-to-br from-gray-900 to-black border border-white/10 rounded-3xl flex items-center justify-center shadow-2xl shadow-black/50"><svg className="w-10 h-10 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg></div></div>
+                                    <h1 className="text-5xl md:text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-b from-white via-white to-white/40 mb-6 tracking-tight">Instant OSS</h1>
+                                    <p className="text-gray-400 mb-10 text-lg font-light leading-relaxed">A secure, local-first workspace for your visual assets.<br/><span className="text-sm text-gray-500">No Cloud Uploads</span></p>
+                                    <div className="flex flex-col sm:flex-row gap-4 justify-center items-center w-full">
+                                        <button onClick={() => fileInputRef.current?.click()} className="w-full sm:w-auto px-8 py-4 bg-white text-black font-semibold rounded-xl transition-all duration-300 hover:scale-[1.02] hover:shadow-[0_0_40px_rgba(255,255,255,0.15)] flex items-center justify-center gap-2 group"><svg className="w-5 h-5 text-gray-800 group-hover:text-black transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" /></svg>Open Local Folder</button>
+                                        <button onClick={() => importInputRef.current?.click()} disabled={isImporting} className="w-full sm:w-auto px-8 py-4 bg-white/5 text-gray-300 border border-white/10 font-medium rounded-xl transition-all duration-300 hover:bg-white/10 hover:text-white hover:border-white/20 backdrop-blur-sm flex items-center justify-center gap-2"><svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>{isImporting ? 'Loading...' : 'Import Snapshot'}</button>
+                                    </div>
+                                </div>
+                                <input ref={fileInputRef} type="file" webkitdirectory="" directory="" multiple className="hidden" onChange={handleUpload} />
+                                <input ref={importInputRef} type="file" accept=".zip" className="hidden" onChange={handleImport} />
+                            </div>
+                        ) : (
+                            <>
+                                <div className="hidden md:block h-full relative z-20"><Sidebar root={rootNode} selectedNode={currentNode} onSelect={handleSelectNode} /></div>
+                                <div className="flex-1 flex flex-col h-full overflow-hidden relative bg-white/[0.02] md:rounded-l-3xl border-l border-white/5 shadow-2xl">
+                                    <header className="h-20 border-b border-white/5 flex items-center justify-between px-8 flex-shrink-0 backdrop-blur-sm">
+                                        <div className="flex items-center gap-4">
+                                            <div className="flex p-1 bg-black/40 rounded-xl border border-white/5">
+                                                <button onClick={() => setViewMode(ViewMode.HIERARCHY)} className={`px-5 py-2 rounded-lg text-xs font-bold transition-all duration-300 ${viewMode === ViewMode.HIERARCHY ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}>Folders</button>
+                                                <button onClick={() => setViewMode(ViewMode.ALL_PHOTOS)} className={`px-5 py-2 rounded-lg text-xs font-bold transition-all duration-300 ${viewMode === ViewMode.ALL_PHOTOS ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}>All Assets</button>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-6">
+                                            <div className="hidden lg:flex items-center gap-6 text-right">
+                                                <div className="flex flex-col"><span className="text-[10px] text-gray-500 uppercase tracking-wider font-bold">Total Assets</span><span className="text-sm text-gray-200 font-mono">{stats.totalFiles}</span></div>
+                                                <div className="w-[1px] h-8 bg-white/10"></div>
+                                                <div className="flex flex-col"><span className="text-[10px] text-gray-500 uppercase tracking-wider font-bold">Size</span><span className="text-sm text-gray-200 font-mono">{stats.totalSize > 0 ? (stats.totalSize / 1024 / 1024).toFixed(0) + ' MB' : 'Local'}</span></div>
+                                            </div>
+                                            <button onClick={handleReset} className="text-gray-500 hover:text-red-400 px-3 py-2 rounded-lg text-xs font-medium transition-colors">Reset Workspace</button>
+                                            <button onClick={handlePublish} className="bg-white text-black hover:bg-gray-100 px-6 py-2.5 rounded-xl text-xs font-bold transition-all shadow-lg shadow-white/5 flex items-center gap-2"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" /></svg>Share Snapshot</button>
+                                        </div>
+                                    </header>
+                                    <main className="flex-1 overflow-hidden relative">
+                                        <Gallery nodes={galleryNodes} onImageClick={setLightboxNode} onFolderClick={handleSelectNode} onToggleDelete={handleToggleDelete} title={viewMode === ViewMode.ALL_PHOTOS ? 'All Photos' : (currentNode?.name || 'Library')} />
+                                    </main>
+                                </div>
+                            </>
+                        )}
+                        {lightboxNode && <Lightbox node={lightboxNode} onClose={() => setLightboxNode(null)} onNext={handleNextImage} onPrev={handlePrevImage} />}
+                        <ShareModal isOpen={isShareModalOpen} onClose={() => setIsShareModalOpen(false)} rootNode={rootNode} stats={{ files: stats.totalFiles, size: stats.totalSize }} />
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
